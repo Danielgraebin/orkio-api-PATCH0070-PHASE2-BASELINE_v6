@@ -1,597 +1,389 @@
-import os
-import time
-import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from __future__ import annotations
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+import os, json, time, uuid
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File as UpFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, text
+from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.orm import Session
+from sqlalchemy import select, func, text
 
-from app.db import ENGINE, SessionLocal
-from app.models import AuditLog, FileBlob, FileText, Message, Tenant, Thread, User
-from app.retrieval import keyword_retrieve
-from app.security import decode_token, hash_password, mint_token, verify_password
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 
+from .db import get_db, ENGINE
+from .models import User, Thread, Message, File, FileText, FileChunk, AuditLog
+from .security import require_secret, new_salt, pbkdf2_hash, verify_password, mint_token, decode_token
+from .extractors import extract_text
+from .retrieval import keyword_retrieve
 
-APP_ENV = os.getenv("APP_ENV", "development")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+# Optional OpenAI
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
 
-JWT_SECRET = os.getenv("JWT_SECRET", "")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-JWT_EXPIRES_IN = int(os.getenv("JWT_EXPIRES_IN", "3600"))
+APP_VERSION = "2.0.1"
+RAG_MODE = "keyword"
 
-TENANT_MODE = os.getenv("TENANT_MODE", "multi")
-DEFAULT_TENANT = os.getenv("DEFAULT_TENANT", "public")
+def new_id() -> str:
+    return uuid.uuid4().hex
 
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
-ADMIN_EMAILS = os.getenv("ADMIN_EMAILS", "")
+def now_ts() -> int:
+    return int(time.time())
 
-ENABLE_STREAMING = os.getenv("ENABLE_STREAMING", "0") == "1"
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
-def admin_emails() -> set:
-    return {e.strip().lower() for e in (ADMIN_EMAILS or "").split(",") if e.strip()}
-
-
-app = FastAPI(title="Orkio API Phase2", version="2.0.0")
-
-
-def _parse_origins(value: str) -> List[str]:
-    value = (value or "").strip()
-    if not value:
+def cors_list() -> List[str]:
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if not raw:
         return ["*"]
-    if value == "*":
-        return ["*"]
-    # allow comma-separated list
-    return [v.strip() for v in value.split(",") if v.strip()]
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
+def tenant_mode() -> str:
+    return os.getenv("TENANT_MODE", "multi")
 
-origins = _parse_origins(CORS_ORIGINS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins if "*" not in origins else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def default_tenant() -> str:
+    return os.getenv("DEFAULT_TENANT", "public")
 
+def admin_api_key() -> str:
+    return os.getenv("ADMIN_API_KEY", "").strip()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def admin_emails() -> List[str]:
+    raw = os.getenv("ADMIN_EMAILS", "").strip()
+    if not raw:
+        return []
+    return [x.strip().lower() for x in raw.split(",") if x.strip()]
 
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def request_id() -> str:
-    return str(uuid.uuid4())
-
+def enable_streaming() -> bool:
+    return os.getenv("ENABLE_STREAMING", "0").strip() in ("1", "true", "True")
 
 def get_org(x_org_slug: Optional[str]) -> str:
-    if TENANT_MODE == "single":
-        return DEFAULT_TENANT
-    return (x_org_slug or DEFAULT_TENANT).strip() or DEFAULT_TENANT
+    if tenant_mode() == "single":
+        return default_tenant()
+    return (x_org_slug or default_tenant()).strip() or default_tenant()
 
+class RegisterIn(BaseModel):
+    tenant: str = Field(default_tenant(), min_length=1)
+    email: EmailStr
+    name: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=6, max_length=256)
 
-def audit(
-    db: Session,
-    org: str,
-    actor_user_id: Optional[str],
-    action: str,
-    path: str,
-    status: int,
-):
+class LoginIn(BaseModel):
+    tenant: str = Field(default_tenant(), min_length=1)
+    email: EmailStr
+    password: str
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: Dict[str, Any]
+
+class ThreadIn(BaseModel):
+    title: str = Field(default="Nova conversa", min_length=1, max_length=200)
+
+class MessageOut(BaseModel):
+    id: str
+    role: str
+    content: str
+    created_at: int
+
+class ChatIn(BaseModel):
+    thread_id: Optional[str] = None
+    message: str = Field(min_length=1)
+    top_k: int = 6
+
+class ChatOut(BaseModel):
+    thread_id: str
+    answer: str
+    citations: List[Dict[str, Any]] = []
+
+def audit(db: Session, org_slug: str, user_id: Optional[str], action: str, request_id: str, path: str, status_code: int, latency_ms: int, meta: Optional[Dict[str, Any]] = None):
+    a = AuditLog(
+        id=new_id(),
+        org_slug=org_slug,
+        user_id=user_id,
+        action=action,
+        meta=json.dumps(meta or {}, ensure_ascii=False),
+        request_id=request_id,
+        path=path,
+        status_code=status_code,
+        latency_ms=latency_ms,
+        created_at=now_ts(),
+    )
+    db.add(a)
+    db.commit()
+
+def get_current_user(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
     try:
-        db.add(
-            AuditLog(
-                org=org,
-                actor_user_id=actor_user_id,
-                action=action,
-                path=path,
-                status=status,
-                created_at=now_ms(),
-            )
-        )
-        db.commit()
+        payload = decode_token(token)
+        return payload
     except Exception:
-        db.rollback()
+        raise HTTPException(status_code=401, detail="Invalid token")
 
+def require_admin(payload: Dict[str, Any]) -> None:
+    if payload.get("role") == "admin":
+        return
+    raise HTTPException(status_code=403, detail="Admin required")
 
-def db_ok(db: Session) -> bool:
+def require_admin_key(x_admin_key: Optional[str]) -> None:
+    k = admin_api_key()
+    if not k:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not configured")
+    if not x_admin_key or x_admin_key != k:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+def db_ok() -> bool:
+    if ENGINE is None:
+        return False
     try:
-        db.execute(text("SELECT 1"))
+        with ENGINE.connect() as conn:
+            conn.execute(text("SELECT 1"))
         return True
     except Exception:
         return False
 
+app = FastAPI(title="Orkio API", version=APP_VERSION)
 
-def get_current_user(authorization: Optional[str]) -> Dict[str, Any]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
-    payload = decode_token(token, secret=JWT_SECRET, algorithm=JWT_ALGORITHM)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return payload
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_list(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+@app.middleware("http")
+async def request_id_mw(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or new_id()
+    start = time.time()
+    try:
+        resp = await call_next(request)
+    finally:
+        pass
+    resp.headers["x-request-id"] = rid
+    resp.headers["x-orkio-version"] = APP_VERSION
+    return resp
 
-def require_admin_key(x_admin_key: Optional[str]):
-    if not ADMIN_API_KEY:
-        raise HTTPException(status_code=500, detail="ADMIN_API_KEY not set")
-    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid admin key")
-
-
-def require_admin_access(
-    authorization: Optional[str] = Header(default=None),
-    x_admin_key: Optional[str] = Header(default=None),
-) -> Dict[str, Any]:
-    """Allow admin by ADMIN_API_KEY (x-admin-key) OR JWT role=admin."""
-    # 1) service/admin key
-    if x_admin_key:
-        try:
-            import secrets as _secrets
-
-            if ADMIN_API_KEY and _secrets.compare_digest(x_admin_key, ADMIN_API_KEY):
-                return {"auth": "admin_key"}
-        except Exception:
-            pass
-
-    # 2) JWT token with admin role (recommended for browser UI)
-    payload = get_current_user(authorization)
-    if payload.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
-    return payload
-
+@app.on_event("startup")
+def _startup():
+    require_secret()
+    if not admin_api_key():
+        raise RuntimeError("ADMIN_API_KEY is not configured (refuse to start)")
 
 @app.get("/api/health")
-def health(db: Session = Depends(get_db)):
-    ok = db_ok(db)
-    return {
-        "status": "ok",
-        "db": "ok" if ok else "down",
-        "version": "2.0.0",
-        "rag": "keyword",
-    }
+def health():
+    return {"status": "ok", "db": "ok" if db_ok() else "down", "version": APP_VERSION, "rag": RAG_MODE}
 
+@app.get("/api/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/api/auth/register")
-def register(
-    tenant: str,
-    email: str,
-    name: str,
-    password: str,
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    org = get_org(tenant or x_org_slug)
+@app.post("/api/auth/register", response_model=TokenOut)
+def register(inp: RegisterIn, db: Session = Depends(get_db)):
+    org = (inp.tenant or default_tenant()).strip()
+    email = inp.email.lower().strip()
+    # auto-admin
+    role = "admin" if email in admin_emails() else "user"
 
-    # Ensure tenant exists
-    t = db.query(Tenant).filter(Tenant.slug == org).first()
-    if not t:
-        t = Tenant(slug=org, created_at=now_ms())
-        db.add(t)
-        db.commit()
-
-    email_norm = email.strip().lower()
-    existing = db.query(User).filter(User.org == org, User.email == email_norm).first()
+    existing = db.execute(select(User).where(User.org_slug == org, User.email == email)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    role = "admin" if email_norm in admin_emails() else "user"
-    u = User(
-        org=org,
-        email=email_norm,
-        name=name.strip(),
-        role=role,
-        password_hash=hash_password(password),
-        created_at=now_ms(),
-    )
+    salt = new_salt()
+    pw_hash = pbkdf2_hash(inp.password, salt)
+    u = User(id=new_id(), org_slug=org, email=email, name=inp.name.strip(), role=role, salt=salt, pw_hash=pw_hash, created_at=now_ts())
     db.add(u)
     db.commit()
 
-    token = mint_token(
-        {
-            "org": org,
-            "user_id": u.id,
-            "email": u.email,
-            "name": u.name,
-            "role": u.role,
-        },
-        secret=JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-        expires_in=JWT_EXPIRES_IN,
-    )
+    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role})
+    return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role}}
 
-    audit(db, org, u.id, "auth.register", "/api/auth/register", 200)
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role},
-    }
-
-
-@app.post("/api/auth/login")
-def login(
-    tenant: str,
-    email: str,
-    password: str,
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    org = get_org(tenant or x_org_slug)
-    email_norm = email.strip().lower()
-
-    u = db.query(User).filter(User.org == org, User.email == email_norm).first()
-    if not u or not verify_password(password, u.password_hash):
-        audit(db, org, None, "auth.login_failed", "/api/auth/login", 401)
+@app.post("/api/auth/login", response_model=TokenOut)
+def login(inp: LoginIn, db: Session = Depends(get_db)):
+    org = (inp.tenant or default_tenant()).strip()
+    email = inp.email.lower().strip()
+    u = db.execute(select(User).where(User.org_slug == org, User.email == email)).scalar_one_or_none()
+    if not u or not verify_password(inp.password, u.salt, u.pw_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    token = mint_token(
-        {
-            "org": org,
-            "user_id": u.id,
-            "email": u.email,
-            "name": u.name,
-            "role": u.role,
-        },
-        secret=JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-        expires_in=JWT_EXPIRES_IN,
-    )
-
-    audit(db, org, u.id, "auth.login", "/api/auth/login", 200)
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role},
-    }
-
+    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role})
+    return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role}}
 
 @app.get("/api/threads")
-def list_threads(
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
-
-    items = (
-        db.query(Thread)
-        .filter(Thread.org == org, Thread.user_id == payload["user_id"])
-        .order_by(Thread.created_at.desc())
-        .all()
-    )
-    return [{"id": t.id, "title": t.title, "created_at": t.created_at} for t in items]
-
+def list_threads(x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
+    rows = db.execute(select(Thread).where(Thread.org_slug == org).order_by(Thread.created_at.desc())).scalars().all()
+    return [{"id": t.id, "title": t.title, "created_at": t.created_at} for t in rows]
 
 @app.post("/api/threads")
-def create_thread(
-    title: str = Form(...),
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
-
-    th = Thread(org=org, user_id=payload["user_id"], title=title, created_at=now_ms())
-    db.add(th)
+def create_thread(inp: ThreadIn, x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
+    t = Thread(id=new_id(), org_slug=org, title=inp.title, created_at=now_ts())
+    db.add(t)
     db.commit()
-
-    audit(db, org, payload["user_id"], "threads.create", "/api/threads", 200)
-    return {"id": th.id, "title": th.title, "created_at": th.created_at}
-
+    return {"id": t.id, "title": t.title, "created_at": t.created_at}
 
 @app.get("/api/messages")
-def list_messages(
-    thread_id: str,
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
+def list_messages(thread_id: str, x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
+    rows = db.execute(select(Message).where(Message.org_slug == org, Message.thread_id == thread_id).order_by(Message.created_at.asc())).scalars().all()
+    return [{"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at} for m in rows]
 
-    th = db.query(Thread).filter(Thread.id == thread_id, Thread.org == org).first()
-    if not th or th.user_id != payload["user_id"]:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
-    items = (
-        db.query(Message)
-        .filter(Message.org == org, Message.thread_id == thread_id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
-    return [
-        {"id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at}
-        for m in items
+def _openai_answer(message: str, context_chunks: List[Dict[str, Any]]) -> Optional[str]:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+    if not key or OpenAI is None:
+        return None
+    client = OpenAI(api_key=key)
+    ctx = ""
+    for c in context_chunks[:6]:
+        fn = c.get("filename") or c.get("file_id")
+        ctx += f"\n\n[Arquivo: {fn}]\n{c.get('content','')}"
+    system = "Você é o Orkio. Responda de forma objetiva. Use o contexto de documentos quando disponível."
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Contexto:\n{ctx}\n\nPergunta: {message}"},
     ]
-
-
-@app.post("/api/messages")
-def create_message(
-    thread_id: str = Form(...),
-    content: str = Form(...),
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
-
-    th = db.query(Thread).filter(Thread.id == thread_id, Thread.org == org).first()
-    if not th or th.user_id != payload["user_id"]:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
-    msg = Message(
-        org=org,
-        thread_id=thread_id,
-        role="user",
-        content=content,
-        created_at=now_ms(),
-    )
-    db.add(msg)
-    db.commit()
-
-    audit(db, org, payload["user_id"], "messages.create", "/api/messages", 200)
-    return {"id": msg.id, "thread_id": msg.thread_id, "created_at": msg.created_at}
-
-
-def _openai_answer(prompt: str) -> str:
-    # Optional: if OPENAI_API_KEY is not set, do a deterministic echo-style answer
-    if not OPENAI_API_KEY:
-        return f"[stub] {prompt}"
-
-    # Best-effort OpenAI call (kept extremely simple; if it fails, we fallback to stub)
     try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are Orkio. Answer using the provided context when relevant. If the context is empty, answer normally.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        return resp.choices[0].message.content or ""
+        r = client.chat.completions.create(model=model, messages=messages)
+        return (r.choices[0].message.content or "").strip()
     except Exception:
-        return f"[stub] {prompt}"
+        return None
 
+@app.post("/api/chat", response_model=ChatOut)
+def chat(inp: ChatIn, x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
 
-@app.post("/api/chat")
-def chat(
-    thread_id: str,
-    message: str,
-    top_k: int = 6,
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
-
-    th = db.query(Thread).filter(Thread.id == thread_id, Thread.org == org).first()
-    if not th or th.user_id != payload["user_id"]:
-        raise HTTPException(status_code=404, detail="Thread not found")
+    # Ensure thread
+    tid = inp.thread_id
+    if not tid:
+        t = Thread(id=new_id(), org_slug=org, title="Nova conversa", created_at=now_ts())
+        db.add(t)
+        db.commit()
+        tid = t.id
 
     # Save user message
-    user_msg = Message(
-        org=org, thread_id=thread_id, role="user", content=message, created_at=now_ms()
-    )
-    db.add(user_msg)
+    m_user = Message(id=new_id(), org_slug=org, thread_id=tid, role="user", content=inp.message, created_at=now_ts())
+    db.add(m_user)
     db.commit()
 
     # Retrieve context (keyword fallback)
-    citations = keyword_retrieve(db, org=org, query=message, top_k=top_k)
+    citations = keyword_retrieve(db, org_slug=org, query=inp.message, top_k=inp.top_k)
 
-    ctx = "\n\n".join([f"[{c['source']}] {c['text']}" for c in citations])
-    prompt = (
-        f"Tenant: {org}\n"
-        f"Thread: {thread_id}\n\n"
-        f"Context:\n{ctx}\n\n"
-        f"User:\n{message}\n\n"
-        f"Answer:"
-    )
-    answer = _openai_answer(prompt).strip() or "..."
-
+    # Answer
+    answer = _openai_answer(inp.message, citations)
+    if not answer:
+        if citations:
+            snippet = (citations[0].get("content") or "")[:600]
+            fn = citations[0].get("filename") or citations[0].get("file_id")
+            answer = f"Encontrei esta informação no documento ({fn}):\n\n{snippet}"
+        else:
+            answer = "Ainda não encontrei informação nos documentos enviados para responder com precisão. Você pode anexar um documento relacionado?"
     # Save assistant message
-    asst_msg = Message(
-        org=org,
-        thread_id=thread_id,
-        role="assistant",
-        content=answer,
-        created_at=now_ms(),
-    )
-    db.add(asst_msg)
+    m_ass = Message(id=new_id(), org_slug=org, thread_id=tid, role="assistant", content=answer, created_at=now_ts())
+    db.add(m_ass)
     db.commit()
 
-    audit(db, org, payload["user_id"], "chat", "/api/chat", 200)
-    return {"answer": answer, "citations": citations, "thread_id": thread_id}
-
-
-def _extract_text(filename: str, content_type: str, data: bytes) -> Tuple[str, bool]:
-    name = (filename or "").lower()
-    ctype = (content_type or "").lower()
-
-    try:
-        if name.endswith(".txt") or name.endswith(".md") or "text/" in ctype:
-            return data.decode("utf-8", errors="ignore"), True
-
-        if name.endswith(".docx"):
-            from docx import Document
-            import io
-
-            doc = Document(io.BytesIO(data))
-            text_out = "\n".join([p.text for p in doc.paragraphs])
-            return text_out, True
-
-        if name.endswith(".pdf"):
-            from pypdf import PdfReader
-            import io
-
-            reader = PdfReader(io.BytesIO(data))
-            parts = []
-            for page in reader.pages:
-                parts.append(page.extract_text() or "")
-            return "\n".join(parts), True
-
-        # unsupported
-        return "", False
-    except Exception:
-        return "", False
-
+    return {"thread_id": tid, "answer": answer, "citations": citations}
 
 @app.post("/api/files/upload")
-def upload_file(
-    file: UploadFile = File(...),
-    thread_id: Optional[str] = Form(default=None),
-    authorization: Optional[str] = Header(default=None),
-    x_org_slug: Optional[str] = Header(default=None),
-    db: Session = Depends(get_db),
-):
-    payload = get_current_user(authorization)
-    org = get_org(x_org_slug or payload.get("org"))
+async def upload(file: UploadFile = UpFile(...), x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
+    filename = file.filename or "upload"
+    raw = await file.read()
+    if len(raw) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Arquivo muito grande (max 10MB)")
 
-    data = file.file.read()
-    fb = FileBlob(
-        org=org,
-        user_id=payload["user_id"],
-        thread_id=thread_id,
-        filename=file.filename,
-        content_type=file.content_type,
-        size_bytes=len(data),
-        data=data,
-        created_at=now_ms(),
-    )
-    db.add(fb)
+    f = File(id=new_id(), org_slug=org, thread_id=None, filename=filename, mime_type=file.content_type, size_bytes=len(raw), content=raw, extraction_failed=False, created_at=now_ts())
+    db.add(f)
     db.commit()
 
-    text_out, extracted = _extract_text(file.filename, file.content_type, data)
-    ft = FileText(
-        org=org,
-        file_id=fb.id,
-        thread_id=thread_id,
-        text=text_out or "",
-        extracted_chars=len(text_out or ""),
-        extraction_failed=not extracted,
-        created_at=now_ms(),
-    )
-    db.add(ft)
-    db.commit()
+    extracted_chars = 0
+    text_content = ""
+    try:
+        text_content, extracted_chars = extract_text(filename, raw)
+        ft = FileText(id=new_id(), org_slug=org, file_id=f.id, text=text_content, extracted_chars=extracted_chars, created_at=now_ts())
+        db.add(ft)
 
-    audit(db, org, payload["user_id"], "files.upload", "/api/files/upload", 200)
-    return {
-        "file_id": fb.id,
-        "filename": fb.filename,
-        "status": "stored",
-        "extracted_chars": ft.extracted_chars,
-    }
+        # Chunking (deterministic)
+        chunk_chars = int(os.getenv("RAG_CHUNK_CHARS", "1200"))
+        overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "200"))
+        text_len = len(text_content)
+        idx = 0
+        pos = 0
+        while pos < text_len:
+            end = min(text_len, pos + chunk_chars)
+            chunk = text_content[pos:end].strip()
+            if chunk:
+                db.add(FileChunk(id=new_id(), org_slug=org, file_id=f.id, idx=idx, content=chunk, created_at=now_ts()))
+                idx += 1
+            if end >= text_len:
+                break
+            pos = max(0, end - overlap)
 
+        db.commit()
+    except Exception:
+        f.extraction_failed = True
+        db.add(f)
+        db.commit()
 
+    return {"file_id": f.id, "filename": f.filename, "status": "stored", "extracted_chars": extracted_chars}
+
+@app.get("/api/files")
+def list_files(x_org_slug: Optional[str] = Header(default=None), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    org = get_org(x_org_slug)
+    rows = db.execute(select(File).where(File.org_slug == org).order_by(File.created_at.desc())).scalars().all()
+    return [{"id": f.id, "filename": f.filename, "size_bytes": f.size_bytes, "extraction_failed": f.extraction_failed, "created_at": f.created_at} for f in rows]
+
+# --- Admin ---
 @app.get("/api/admin/overview")
-def admin_overview(
-    admin: Dict[str, Any] = Depends(require_admin_access),
-    db: Session = Depends(get_db),
-):
-    # aggregated counts (simple)
-    tenants = db.query(func.count(Tenant.id)).scalar() or 0
-    users = db.query(func.count(User.id)).scalar() or 0
-    threads = db.query(func.count(Thread.id)).scalar() or 0
-    messages = db.query(func.count(Message.id)).scalar() or 0
-    files = db.query(func.count(FileBlob.id)).scalar() or 0
-
+def admin_overview(x_admin_key: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    require_admin_key(x_admin_key)
     return {
-        "tenants": tenants,
-        "users": users,
-        "threads": threads,
-        "messages": messages,
-        "files": files,
+        "tenants": db.execute(select(func.count(func.distinct(User.org_slug)))).scalar_one(),
+        "users": db.execute(select(func.count(User.id))).scalar_one(),
+        "threads": db.execute(select(func.count(Thread.id))).scalar_one(),
+        "messages": db.execute(select(func.count(Message.id))).scalar_one(),
+        "files": db.execute(select(func.count(File.id))).scalar_one(),
     }
-
 
 @app.get("/api/admin/users")
-def admin_users(
-    admin: Dict[str, Any] = Depends(require_admin_access),
-    db: Session = Depends(get_db),
-):
-    items = db.query(User).order_by(User.created_at.desc()).limit(200).all()
-    return [
-        {
-            "id": u.id,
-            "org": u.org,
-            "email": u.email,
-            "name": u.name,
-            "role": u.role,
-            "created_at": u.created_at,
-        }
-        for u in items
-    ]
-
+def admin_users(x_admin_key: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    require_admin_key(x_admin_key)
+    rows = db.execute(select(User).order_by(User.created_at.desc()).limit(200)).scalars().all()
+    return [{"id": u.id, "org_slug": u.org_slug, "email": u.email, "name": u.name, "role": u.role, "created_at": u.created_at} for u in rows]
 
 @app.get("/api/admin/files")
-def admin_files(
-    admin: Dict[str, Any] = Depends(require_admin_access),
-    db: Session = Depends(get_db),
-):
-    items = db.query(FileBlob).order_by(FileBlob.created_at.desc()).limit(200).all()
+def admin_files(x_admin_key: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    require_admin_key(x_admin_key)
+    rows = db.execute(select(File).order_by(File.created_at.desc()).limit(200)).scalars().all()
+    return [{"id": f.id, "org_slug": f.org_slug, "filename": f.filename, "size_bytes": f.size_bytes, "extraction_failed": f.extraction_failed, "created_at": f.created_at} for f in rows]
+
+@app.get("/api/admin/audit")
+def admin_audit(x_admin_key: Optional[str] = Header(default=None), db: Session = Depends(get_db)):
+    require_admin_key(x_admin_key)
+    rows = db.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).scalars().all()
     out = []
-    for f in items:
-        ft = db.query(FileText).filter(FileText.file_id == f.id).first()
+    for a in rows:
+        try:
+            meta = json.loads(a.meta) if a.meta else {}
+        except Exception:
+            meta = {}
         out.append(
             {
-                "id": f.id,
-                "org": f.org,
-                "filename": f.filename,
-                "content_type": f.content_type,
-                "size_bytes": f.size_bytes,
-                "created_at": f.created_at,
-                "extracted_chars": (ft.extracted_chars if ft else 0),
-                "extraction_failed": (ft.extraction_failed if ft else True),
+                "id": a.id,
+                "org_slug": a.org_slug,
+                "user_id": a.user_id,
+                "action": a.action,
+                "meta": meta,
+                "request_id": a.request_id,
+                "path": a.path,
+                "status_code": a.status_code,
+                "latency_ms": a.latency_ms,
+                "created_at": a.created_at,
             }
         )
     return out
 
-
-@app.get("/api/admin/audit")
-def admin_audit(
-    limit: int = 30,
-    admin: Dict[str, Any] = Depends(require_admin_access),
-    db: Session = Depends(get_db),
-):
-    lim = max(1, min(200, int(limit)))
-    items = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(lim).all()
-    return [
-        {
-            "when": a.created_at,
-            "org": a.org,
-            "action": a.action,
-            "path": a.path,
-            "status": a.status,
-        }
-        for a in items
-    ]
-
-
-@app.on_event("startup")
-def startup_checks():
-    if not JWT_SECRET:
-        raise RuntimeError("JWT_SECRET is required")
-    if not ADMIN_API_KEY:
-        raise RuntimeError("ADMIN_API_KEY is required")
